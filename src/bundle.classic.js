@@ -6263,13 +6263,15 @@ class MemeLudkaModule {
       img.onerror = finish;
       video.replaceWith(img);
     };
-    video.addEventListener('ended', showImage, { once: true });
+    video.loop = true;
     video.addEventListener('error', showImage, { once: true });
     fetch('./api/memes').then(response => { if (!response.ok) throw new Error('API unavailable'); return response.json(); }).catch(() => fetch('./memes.json').then(response => response.json())).then(data => {
       if (closed) return;
       memes = data.memes || [];
       const videos = memes.filter(item => item.type === 'video');
-      if (!videos.length) { showImage(); return; }
+      const images = memes.filter(item => item.type === 'image');
+      if (!videos.length && !images.length) { finish(); return; }
+      if (images.length && (!videos.length || Math.random() < 0.5)) { showImage(); return; }
       video.src = pick(videos).src;
       video.play().catch(() => { video.muted = true; video.play().catch(showImage); });
     }).catch(finish);
