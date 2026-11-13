@@ -1,0 +1,48 @@
+{
+  "memes": [
+    {
+      "type": "video",
+      "src": "./memes/c4c60f57-4dc8-43f1-b5fb-31531357b88e.mp4"
+    },
+    {
+      "type": "video",
+      "src": "./memes/maldicao_2fqp6_1.mov"
+    },
+    {
+      "type": "image",
+      "src": "./memes/photo_2025-04-02_16-47-16.jpg"
+    },
+    {
+      "type": "image",
+      "src": "./memes/photo_2026-11-13_14-10-26.jpg"
+    },
+    {
+      "type": "image",
+      "src": "./memes/photo_2026-11-13_14-21-33.jpg"
+    },
+    {
+      "type": "image",
+      "src": "./memes/photo_2026-11-13_14-27-27.jpg"
+    },
+    {
+      "type": "image",
+      "src": "./memes/photo_2026-11-13_14-27-31.jpg"
+    },
+    {
+      "type": "video",
+      "src": "./memes/thud.mov"
+    },
+    {
+      "type": "video",
+      "src": "./memes/video_2026-11-13_14-11-23.mp4"
+    },
+    {
+      "type": "video",
+      "src": "./memes/video_2026-11-13_14-18-09.mp4"
+    },
+    {
+      "type": "video",
+      "src": "./memes/video_2026-11-13_14-19-30.mp4"
+    }
+  ]
+}
