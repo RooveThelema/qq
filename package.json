@@ -1,15 +1,24 @@
 {
-  "name": "blinov-zombies-2d",
-  "version": "2.0.0",
+  "name": "last-frontier-survivors",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
-  "description": "Call of Duty: Zombies 2D — бункер, мем-реклама, жесткая лудка 777 и PostgreSQL бэкенд",
+  "description": "Последний рубеж — survivors-like с совместной игрой до 10 игроков и туннелем без VPS",
   "scripts": {
     "build:classic": "node scripts/build-classic.mjs",
     "db:init": "psql -U ${PGUSER:-roovethelema} -h ${PGHOST:-127.0.0.1} -p ${PGPORT:-5432} -d ${PGDATABASE:-blinov_zombies} -f db/schema.sql",
-    "start": "node scripts/build-classic.mjs && node server.js"
+    "start": "node scripts/build-classic.mjs && node server.js",
+    "share": "node scripts/share.mjs",
+    "test": "node --test tests/*.test.js",
+    "check": "node --check server.js && node --check src/main.js && node --check src/game/World.js && node --check scripts/share.mjs && node --check src/game/Director.js && node --check src/ui/Renderer.js && node --check src/ui/NetworkClient.js && node --check src/ui/MotionBuffer.js",
+    "test:online": "node scripts/smoke-online.mjs",
+    "benchmark": "node scripts/benchmark.mjs"
   },
   "dependencies": {
-    "pg": "^8.20.0"
+    "pg": "^8.20.0",
+    "ws": "^8.23.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

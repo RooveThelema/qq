@@ -1,14 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
 const SRC_ROOT = path.join(ROOT, 'src');
-const memeDir = path.join(ROOT, 'memes');
-const memeFiles = fs.existsSync(memeDir) ? fs.readdirSync(memeDir, { withFileTypes: true }).filter(entry => entry.isFile() && /\.(mp4|webm|mov|m4v|ogv|jpg|jpeg|png|gif|webp|avif)$/i.test(entry.name)).map(entry => ({ type: /\.(mp4|webm|mov|m4v|ogv)$/i.test(entry.name) ? 'video' : 'image', src: './memes/' + encodeURIComponent(entry.name) })) : [];
-fs.writeFileSync(path.join(ROOT, 'memes.json'), JSON.stringify({ memes: memeFiles }, null, 2));
 const ENTRY = path.join(SRC_ROOT, 'main.js');
 const OUT_FILE = path.join(SRC_ROOT, 'bundle.classic.js');
 
@@ -65,7 +63,13 @@ function transformModule(mod) {
 }
 
 const chunks = ordered.map(transformModule).join('\n\n');
-const bundle = `/* Автоматически сгенерированный classic-бандл для file:// fallback */\n(function() {\n  if (window.__BLINOV_BOOTED__) return;\n  const __modules = Object.create(null);\n  const __cache = Object.create(null);\n  function __require(id) {\n    if (__cache[id]) return __cache[id].exports;\n    const mod = { exports: {} };\n    __cache[id] = mod;\n    if (!__modules[id]) throw new Error('Classic bundle missing module: ' + id);\n    __modules[id](mod.exports, __require);\n    return mod.exports;\n  }\n\n${chunks}\n\n  __require('src/main.js');\n})();\n`;
+const bundle = `/* Автоматически сгенерированный автономный бандл: HTTP(S) и file:// */\n(function() {\n  if (window.__BLINOV_BOOTED__) return;\n  const __modules = Object.create(null);\n  const __cache = Object.create(null);\n  function __require(id) {\n    if (__cache[id]) return __cache[id].exports;\n    const mod = { exports: {} };\n    __cache[id] = mod;\n    if (!__modules[id]) throw new Error('Classic bundle missing module: ' + id);\n    __modules[id](mod.exports, __require);\n    return mod.exports;\n  }\n\n${chunks}\n\n  __require('src/main.js');\n})();\n`;
 
 fs.writeFileSync(OUT_FILE, bundle, 'utf8');
+const version = crypto.createHash('sha256').update(bundle).update(fs.readFileSync(path.join(ROOT, 'styles.css'))).digest('hex').slice(0, 12);
+const indexPath = path.join(ROOT, 'index.html');
+const html = fs.readFileSync(indexPath, 'utf8');
+if (!/data-build="[^"]*"/.test(html)) throw new Error('Missing data-build marker in index.html');
+fs.writeFileSync(indexPath, html.replace(/data-build="[^"]*"/, `data-build="${version}"`), 'utf8');
+console.log(`Asset version: ${version}`);
 console.log(`Built ${path.relative(ROOT, OUT_FILE)} (${ordered.length} modules, ${bundle.length} bytes)`);

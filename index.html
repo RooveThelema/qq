@@ -1,24 +1,57 @@
 <!doctype html>
-<html lang="ru">
+<html lang="ru" data-build="08240143b035">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Проект закрылся</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101815">
+  <meta name="description" content="Последний рубеж — кооперативный автошутер на выживание. Собери отряд до четырёх игроков, прокачивай оружие и останови орду.">
+  <title>Последний рубеж — выживаем вместе</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
   <style>
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #111; color: #f2f2f2; font-family: system-ui, sans-serif; text-align: center; }
-    main { width: min(100%, 800px); }
-    h1 { font-size: clamp(24px, 5vw, 40px); font-weight: 600; }
-    video { display: block; width: 100%; max-height: 75vh; background: #000; }
+    html,body{margin:0;background:#101815;color:#eef0dd;font-family:system-ui,sans-serif}#boot-screen{position:fixed;inset:0;z-index:9999;display:grid;place-items:center;background:#101815;padding:24px;text-align:center}#boot-screen[hidden]{display:none}.boot-card{width:min(390px,100%)}.boot-mark{color:#f3a45e;font-size:40px;line-height:1}.boot-card h1{font-size:21px;letter-spacing:2px;margin:22px 0 12px}.boot-copy{font-size:12px;line-height:1.8;color:#a5b29a;min-height:43px}.boot-progress{height:3px;background:#a5b29a22;margin:25px 0 12px;overflow:hidden}.boot-progress i{display:block;height:100%;width:8%;background:#f3a45e;transition:width .3s}.boot-stage{font:10px ui-monospace,monospace;letter-spacing:1px;color:#879c7b}.boot-retry{padding:12px 20px;margin-top:25px;border:1px solid #efb47a;background:#f3a45e;color:#20271c;border-radius:3px;cursor:pointer;font:600 12px system-ui,sans-serif}.boot-retry[hidden]{display:none}.boot-card small{display:block;font-size:10px;line-height:1.7;color:#7b9070;margin-top:19px}.boot-failed .boot-progress i{background:#d98c75}
   </style>
 </head>
 <body>
-  <main>
-    <h1>Проект закрылся, простите.</h1>
-    <video autoplay muted loop playsinline controls>
-      <source src="./memes/video_2026-11-13_14-19-30.mp4" type="video/mp4">
-      Ваш браузер не поддерживает видео.
-    </video>
-  </main>
+  <canvas id="gameCanvas" aria-label="Игровая арена"></canvas>
+  <div class="menu-vignette" id="menu-vignette"></div>
+  <div id="app"></div>
+  <div id="boot-screen" role="status" aria-live="polite"><div class="boot-card"><div class="boot-mark">↗</div><h1>ПОСЛЕДНИЙ РУБЕЖ</h1><p class="boot-copy" id="boot-copy">Загружаем игру и готовим связь с отрядом.</p><div class="boot-progress"><i id="boot-progress"></i></div><div class="boot-stage" id="boot-stage">ПОДГОТОВКА ЗАГРУЗКИ</div><button class="boot-retry" id="boot-retry" type="button" hidden>Повторить загрузку</button><small id="boot-hint">Первый запуск может занять несколько секунд.</small></div></div>
+  <noscript><div style="position:fixed;inset:0;background:#101815;display:grid;place-content:center;text-align:center;z-index:10000;padding:24px">Для игры включи JavaScript в браузере.</div></noscript>
+  <script>
+    (() => {
+      const screen = document.getElementById('boot-screen');
+      const progress = document.getElementById('boot-progress');
+      const stage = document.getElementById('boot-stage');
+      const copy = document.getElementById('boot-copy');
+      const retry = document.getElementById('boot-retry');
+      const build = document.documentElement.dataset.build || 'development';
+      let cssReady = false, gameReady = false, failed = false;
+      function finish() {
+        if (!cssReady || !gameReady || failed) return;
+        clearTimeout(timer); progress.style.width = '100%'; stage.textContent = 'ГОТОВО'; screen.hidden = true;
+      }
+      function fail(message) {
+        if (screen.hidden || failed) return;
+        failed = true; clearTimeout(timer); screen.classList.add('boot-failed');
+        copy.textContent = message; stage.textContent = 'ЗАГРУЗКА ПРЕРВАНА'; retry.hidden = false;
+        document.getElementById('boot-hint').textContent = 'Если повторная загрузка не помогла, попроси создателя комнаты проверить туннель и прислать актуальную ссылку.';
+      }
+      const timer = setTimeout(() => fail('Сервер не успел передать игру за 20 секунд. Проверь соединение и попробуй ещё раз.'), 20000);
+      retry.onclick = () => {
+        const url = new URL(location.href); url.searchParams.set('_reload', Date.now().toString()); location.replace(url.href);
+      };
+      window.addEventListener('frontier:ready', () => { gameReady = true; progress.style.width = cssReady ? '100%' : '75%'; finish(); }, { once: true });
+      window.addEventListener('frontier:boot-error', event => fail(event.detail || 'Не удалось запустить игру. Попробуй загрузить страницу ещё раз.'), { once: true });
+      const style = document.createElement('link'); style.rel = 'stylesheet'; style.href = './styles.css?v=' + encodeURIComponent(build);
+      style.onload = () => { cssReady = true; progress.style.width = gameReady ? '100%' : '35%'; stage.textContent = gameReady ? 'ГОТОВО' : 'ЗАГРУЖАЕМ ИГРУ'; finish(); };
+      style.onerror = () => fail('Не удалось загрузить оформление игры. Проверь соединение и попробуй ещё раз.');
+      document.head.appendChild(style);
+      const script = document.createElement('script'); script.src = './src/bundle.classic.js?v=' + encodeURIComponent(build); script.async = true;
+      script.onload = () => { if (!gameReady) fail('Игра загрузилась, но не смогла запуститься. Попробуй повторить загрузку.'); };
+      script.onerror = () => fail('Не удалось получить игру с сервера. Проверь, что ссылка туннеля ещё работает.');
+      stage.textContent = 'ЗАГРУЖАЕМ ФАЙЛЫ ИГРЫ'; progress.style.width = '15%';
+      document.body.appendChild(script);
+    })();
+  </script>
 </body>
 </html>

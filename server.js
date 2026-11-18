@@ -1,434 +1,338 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import os from 'node:os';
+import crypto from 'node:crypto';
+import { gzipSync, gzip } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
-import pg from 'pg';
+import { WebSocketServer, WebSocket } from 'ws';
+import { packState } from './src/game/codec.js';
+import { World } from './src/game/World.js';
+import { MAPS, HEROES, MAX_PLAYERS } from './src/game/catalog.js';
 
-const { Pool } = pg;
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+const validName = name => String(name || 'Выживший').replace(/[\x00-\x1f<>]/g, '').trim().slice(0, 20) || 'Выживший';
+const MAX_BACKLOG = 65536;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const ROOT = __dirname;
-const PORT = Number(process.env.PORT || 3000);
-const HOST = process.env.HOST || '0.0.0.0';
+// Control messages survive temporary congestion; stale snapshots are expendable.
+function send(peer, data, serialized) {
+  if (!peer || peer.readyState !== WebSocket.OPEN) return;
+  if (peer.transport === 'http') { peer.send(data); return; }
+  peer.controlQueue ||= [];
+  if (data.type === 'state') {
+    if (!peer.controlQueue.length && peer.bufferedAmount < MAX_BACKLOG) peer.send(serialized || JSON.stringify(data));
+    return;
+  }
+  if (data.type === 'room') peer.controlQueue = peer.controlQueue.filter(item => item.type !== 'room');
+  if (peer.controlQueue.length >= 32) { peer.close(1013, 'Соединение слишком медленное. Переподключитесь'); return; }
+  peer.controlQueue.push(data);
+  flush(peer);
+}
+function flush(peer) {
+  if (peer.transport === 'http' || peer.readyState !== WebSocket.OPEN) return;
+  while (peer.controlQueue?.length && peer.bufferedAmount < MAX_BACKLOG) peer.send(JSON.stringify(peer.controlQueue.shift()));
+}
+async function readBody(req) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 4096) throw new Error('Слишком большой запрос');
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+}
 
-const poolConfig = process.env.DATABASE_URL
-  ? { connectionString: process.env.DATABASE_URL }
-  : {
-      host: process.env.PGHOST || '127.0.0.1',
-      port: Number(process.env.PGPORT || 5432),
-      database: process.env.PGDATABASE || 'blinov_zombies',
-      user: process.env.PGUSER || process.env.USER || 'roovethelema',
-      ...(process.env.PGPASSWORD ? { password: process.env.PGPASSWORD } : {}),
+export function createGameServer({ scoresPath = path.join(ROOT, 'data', 'scores.json'), reconnectMs = 30000, maxRooms = 64 } = {}) {
+  const rooms = new Map();
+  const sessions = new Map();
+  const attempts = new Map();
+  const staticCache = new Map();
+  let scores = [];
+  let persist = Promise.resolve();
+  let pool;
+  let tickCount = 0;
+  try { scores = JSON.parse(fs.readFileSync(scoresPath, 'utf8')).slice(0, 100); } catch { /* First launch. */ }
+  if (process.env.DATABASE_URL) {
+    import('pg').then(async ({ default: pg }) => {
+      pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 3000 });
+      pool.on('error', err => console.error('[DB]', err.message));
+      await pool.query(fs.readFileSync(path.join(ROOT, 'db/schema.sql'), 'utf8'));
+      console.log('[DB] PostgreSQL подключён');
+    }).catch(err => console.error('[DB] Используется файловая таблица рекордов:', err.message));
+  }
+
+  function record(room) {
+    if (room.saved) return;
+    room.saved = true;
+    const result = { id: crypto.randomUUID(), map: room.world.mapId, runMode: room.world.director.mode, completed: room.world.director.completed, time: Math.floor(room.world.time), kills: room.world.kills, victory: room.world.status === 'victory',
+      players: [...room.world.players.values()].map(p => ({ name: p.name, hero: p.hero, kills: p.kills, level: p.level })), createdAt: new Date().toISOString() };
+    scores.push(result);
+    scores.sort((a, b) => Number(b.victory) - Number(a.victory) || b.time - a.time || b.kills - a.kills);
+    scores = scores.slice(0, 100);
+    const text = JSON.stringify(scores, null, 2);
+    persist = persist.then(async () => {
+      await fs.promises.mkdir(path.dirname(scoresPath), { recursive: true });
+      await fs.promises.writeFile(scoresPath + '.tmp', text);
+      await fs.promises.rename(scoresPath + '.tmp', scoresPath);
+    }).catch(err => console.error('[scores]', err.message));
+    if (pool) pool.query('INSERT INTO survivor_runs (id, map_id, survived_sec, kills, victory, players) VALUES ($1,$2,$3,$4,$5,$6)', [result.id, result.map, result.time, result.kills, result.victory, JSON.stringify(result.players)]).catch(err => console.error('[DB]', err.message));
+  }
+
+  function json(res, code, data, compress = false) {
+    let body = Buffer.from(JSON.stringify(data));
+    const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Vary': 'Accept-Encoding' };
+    const finish = (bytes, compressed = false) => {
+      if (res.destroyed) return;
+      if (compressed) headers['Content-Encoding'] = 'gzip';
+      headers['Content-Length'] = bytes.length;
+      res.writeHead(code, headers); res.end(bytes);
     };
-
-const pool = new Pool(poolConfig);
-
-const MIME_TYPES = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
-  '.mjs': 'application/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.avif': 'image/avif',
-  '.ico': 'image/x-icon',
-  '.mp4': 'video/mp4',
-  '.webm': 'video/webm',
-  '.mov': 'video/quicktime',
-  '.m4v': 'video/mp4',
-};
-
-const MEME_VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
-const MEME_IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif']);
-
-function scanMemesDirectory() {
-  const memesDir = path.join(ROOT, 'memes');
-  if (!fs.existsSync(memesDir)) return [];
-
-  const files = fs
-    .readdirSync(memesDir, { withFileTypes: true })
-    .filter((d) => d.isFile())
-    .map((d) => d.name)
-    .sort((a, b) => a.localeCompare(b));
-
-  const seenHashes = new Set();
-  const memes = [];
-
-  for (const fileName of files) {
-    const ext = path.extname(fileName).toLowerCase();
-    const isVideo = MEME_VIDEO_EXTS.has(ext);
-    const isImage = MEME_IMAGE_EXTS.has(ext);
-    if (!isVideo && !isImage) continue;
-
-    const fullPath = path.join(memesDir, fileName);
-    const hash = crypto.createHash('sha256').update(fs.readFileSync(fullPath)).digest('hex');
-    if (seenHashes.has(hash)) continue;
-    seenHashes.add(hash);
-
-    const numTag = String(memes.length + 1).padStart(2, '0');
-    memes.push({
-      id: `meme_${hash.slice(0, 10)}`,
-      type: isVideo ? 'video' : 'image',
-      src: `./memes/${encodeURIComponent(fileName)}`,
-      title: `АРХИВ // ${numTag}`,
-      caption: '',
-      duration: isVideo ? 6 : 4,
-    });
+    if (compress && body.length > 512) gzip(body, { level: 3 }, (err, bytes) => finish(err ? body : bytes, !err));
+    else finish(body);
   }
 
-  return memes;
-}
-
-const BLOCKED_PREFIXES = ['/db', '/node_modules', '/scripts', '/.git', '/.github'];
-const BLOCKED_FILES = new Set(['/server.js', '/package.json', '/package-lock.json', '/start-local.sh', '/.env']);
-
-function setCorsHeaders(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-}
-
-function sendJson(res, status, payload) {
-  setCorsHeaders(res);
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
-  });
-  res.end(body);
-}
-
-function readJsonBody(req, maxBytes = 32768) {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on('data', (chunk) => {
-      size += chunk.length;
-      if (size > maxBytes) {
-        reject(new Error('Payload too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      try {
-        const raw = Buffer.concat(chunks).toString('utf8').trim();
-        resolve(raw ? JSON.parse(raw) : {});
-      } catch {
-        reject(new Error('Invalid JSON'));
-      }
-    });
-    req.on('error', reject);
-  });
-}
-
-function sanitizeNickname(value) {
-  const clean = String(value || 'BunkerFighter').trim().replace(/[<>]/g, '').slice(0, 32);
-  return clean || 'BunkerFighter';
-}
-
-function clampInt(value, fallback = 0, max = 100000000) {
-  const n = Math.floor(Number(value));
-  if (!Number.isFinite(n) || n < 0) return fallback;
-  return Math.min(max, n);
-}
-
-async function ensureSchema() {
-  const schemaPath = path.join(ROOT, 'db', 'schema.sql');
-  if (fs.existsSync(schemaPath)) {
-    const sql = fs.readFileSync(schemaPath, 'utf8');
-    await pool.query(sql);
-  }
-}
-
-const multiplayerRooms = new Map();
-function multiplayerRoom(name) {
-  if (!multiplayerRooms.has(name)) multiplayerRooms.set(name, { players: new Map(), host: null, world: null, events: [] });
-  return multiplayerRooms.get(name);
-}
-
-async function handleApi(req, res, urlObj) {
-  const pathname = urlObj.pathname;
-
-  if (req.method === 'POST' && pathname === '/api/multiplayer') {
-    const data = await readJsonBody(req, 524288);
-    const roomName = String(data.room || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24);
-    const id = String(data.id || '').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 64);
-    if (!roomName || !id) return sendJson(res, 400, { error: 'Invalid room or player' });
-    const oldRoom = multiplayerRooms.get(roomName);
-    if (oldRoom) {
-      for (const [key, player] of oldRoom.players) if (Date.now() - player.seen > 12000) oldRoom.players.delete(key);
-      if (!oldRoom.players.size) multiplayerRooms.delete(roomName);
-    }
-    const exists = multiplayerRooms.has(roomName);
-    if (data.action === 'create' && exists && multiplayerRooms.get(roomName).players.size) return sendJson(res, 409, { error: 'Комната уже существует' });
-    if (data.action === 'join' && !exists) return sendJson(res, 404, { error: 'Комната не найдена' });
-    const room = multiplayerRoom(roomName);
-    const now = Date.now();
-    for (const [key, player] of room.players) if (now - player.seen > 12000) room.players.delete(key);
-    if (!room.players.has(room.host)) { room.host = room.players.keys().next().value || id; room.world = null; }
-    if (data.leave) {
-      room.players.delete(id);
-      if (!room.players.size) multiplayerRooms.delete(roomName);
-      return sendJson(res, 200, { ok: true });
-    }
-    room.players.set(id, { id, name: String(data.name || 'Игрок').slice(0, 20), x: Number(data.x) || 0, y: Number(data.y) || 0, angle: Number(data.angle) || 0, hp: Number(data.hp) || 0, seen: now });
-    if (id === room.host && data.world) room.world = data.world;
-    if (Array.isArray(data.events)) for (const event of data.events.slice(0, 50)) room.events.push({ ...event, from: id, seq: crypto.randomUUID(), time: now });
-    room.events = room.events.filter(event => now - event.time < 5000).slice(-500);
-    return sendJson(res, 200, { host: room.host, players: [...room.players.values()], world: room.world, events: room.events });
-  }
-
-  if (req.method === 'GET' && pathname === '/api/network') {
-    const addresses = Object.values(os.networkInterfaces()).flat().filter(item => item && item.family === 'IPv4' && !item.internal).map(item => `http://${item.address}:${PORT}/`);
-    return sendJson(res, 200, { addresses });
-  }
-
-  if (req.method === 'GET' && pathname === '/api/memes') {
-    const memes = scanMemesDirectory();
-    return sendJson(res, 200, { ok: true, memes });
-  }
-
-  if (req.method === 'GET' && pathname === '/api/health') {
-    const result = await pool.query('SELECT current_database() AS database, NOW() AS server_time');
-    return sendJson(res, 200, {
-      ok: true,
-      db: 'postgresql',
-      database: result.rows[0]?.database || poolConfig.database,
-      serverTime: result.rows[0]?.server_time,
-    });
-  }
-
-  if (req.method === 'GET' && pathname === '/api/leaderboard') {
-    const limit = Math.max(1, Math.min(50, clampInt(urlObj.searchParams.get('limit') || 15, 15, 50)));
-    const [runsRes, profilesRes, ludkaRes, summaryRes] = await Promise.all([
-      pool.query(
-        `SELECT id, nickname, round_reached, kills, headshots, points_final, total_earned,
-                shots_fired, ludka_spins, memes_watched, revived_used, survived_sec, created_at
-         FROM game_runs
-         ORDER BY round_reached DESC, total_earned DESC, kills DESC, created_at DESC
-         LIMIT $1`,
-        [limit]
-      ),
-      pool.query(
-        `SELECT nickname, best_round, best_score, total_kills, total_headshots,
-                total_coins_earned, ludka_spins, memes_watched, updated_at
-         FROM player_profiles
-         ORDER BY best_round DESC, best_score DESC
-         LIMIT $1`,
-        [limit]
-      ),
-      pool.query(
-        `SELECT id, nickname, meme_id, meme_type, outcome_id, outcome_title,
-                coins_delta, weapon_won, risked, risk_won, created_at
-         FROM ludka_history
-         ORDER BY created_at DESC
-         LIMIT $1`,
-        [limit]
-      ),
-      pool.query(
-        `SELECT
-           (SELECT COUNT(*)::int FROM game_runs) AS total_runs,
-           (SELECT COALESCE(SUM(kills), 0)::bigint FROM game_runs) AS total_kills,
-           (SELECT COALESCE(MAX(round_reached), 1)::int FROM game_runs) AS top_round,
-           (SELECT COUNT(*)::int FROM ludka_history) AS total_ludka_spins`
-      ),
-    ]);
-
-    return sendJson(res, 200, {
-      ok: true,
-      runs: runsRes.rows,
-      profiles: profilesRes.rows,
-      ludkaHistory: ludkaRes.rows,
-      summary: summaryRes.rows[0] || {},
-    });
-  }
-
-  if (req.method === 'POST' && pathname === '/api/runs') {
-    const body = await readJsonBody(req);
-    const nickname = sanitizeNickname(body.nickname);
-    const roundReached = Math.max(1, clampInt(body.roundReached ?? body.round_reached, 1, 9999));
-    const kills = clampInt(body.kills, 0);
-    const headshots = clampInt(body.headshots, 0);
-    const pointsFinal = clampInt(body.pointsFinal ?? body.points_final, 0);
-    const totalEarned = Math.max(pointsFinal, clampInt(body.totalEarned ?? body.total_earned, 0));
-    const shotsFired = clampInt(body.shotsFired ?? body.shots_fired, 0);
-    const ludkaSpins = clampInt(body.ludkaSpins ?? body.ludka_spins, 0, 10000);
-    const memesWatched = clampInt(body.memesWatched ?? body.memes_watched, 0, 10000);
-    const revivedUsed = clampInt(body.revivedUsed ?? body.revived_used, 0, 1000);
-    const survivedSec = clampInt(body.survivedSec ?? body.survived_sec, 0, 864000);
-
-    const client = await pool.connect();
+  const server = http.createServer(async (req, res) => {
     try {
-      await client.query('BEGIN');
-      const insertRun = await client.query(
-        `INSERT INTO game_runs (
-           nickname, round_reached, kills, headshots, points_final, total_earned,
-           shots_fired, ludka_spins, memes_watched, revived_used, survived_sec
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         RETURNING *`,
-        [nickname, roundReached, kills, headshots, pointsFinal, totalEarned, shotsFired, ludkaSpins, memesWatched, revivedUsed, survivedSec]
-      );
-
-      await client.query(
-        `INSERT INTO player_profiles (
-           nickname, best_round, best_score, total_kills, total_headshots,
-           total_coins_earned, ludka_spins, memes_watched, updated_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-         ON CONFLICT (nickname) DO UPDATE SET
-           best_round = GREATEST(player_profiles.best_round, EXCLUDED.best_round),
-           best_score = GREATEST(player_profiles.best_score, EXCLUDED.best_score),
-           total_kills = player_profiles.total_kills + EXCLUDED.total_kills,
-           total_headshots = player_profiles.total_headshots + EXCLUDED.total_headshots,
-           total_coins_earned = player_profiles.total_coins_earned + EXCLUDED.total_coins_earned,
-           ludka_spins = player_profiles.ludka_spins + EXCLUDED.ludka_spins,
-           memes_watched = player_profiles.memes_watched + EXCLUDED.memes_watched,
-           updated_at = NOW()`,
-        [nickname, roundReached, totalEarned, kills, headshots, totalEarned, ludkaSpins, memesWatched]
-      );
-      await client.query('COMMIT');
-
-      return sendJson(res, 201, { ok: true, run: insertRun.rows[0] });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
-  }
-
-  if (req.method === 'POST' && pathname === '/api/ludka') {
-    const body = await readJsonBody(req);
-    const nickname = sanitizeNickname(body.nickname);
-    const memeId = body.memeId ? String(body.memeId).slice(0, 80) : null;
-    const memeType = body.memeType ? String(body.memeType).slice(0, 16) : null;
-    const outcomeId = String(body.outcomeId || body.kind || 'unknown').slice(0, 64);
-    const outcomeTitle = String(body.outcomeTitle || body.title || 'Лудка 777').slice(0, 120);
-    const coinsDelta = Math.trunc(Number(body.coinsDelta ?? body.coins ?? 0)) || 0;
-    const weaponWon = body.weaponWon ? String(body.weaponWon).slice(0, 32) : null;
-    const risked = Boolean(body.risked);
-    const riskWon = body.riskWon === undefined || body.riskWon === null ? null : Boolean(body.riskWon);
-
-    const ins = await pool.query(
-      `INSERT INTO ludka_history (
-         nickname, meme_id, meme_type, outcome_id, outcome_title,
-         coins_delta, weapon_won, risked, risk_won
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       RETURNING *`,
-      [nickname, memeId, memeType, outcomeId, outcomeTitle, coinsDelta, weaponWon, risked, riskWon]
-    );
-
-    return sendJson(res, 201, { ok: true, entry: ins.rows[0] });
-  }
-
-  return sendJson(res, 404, { ok: false, error: 'Not found' });
-}
-
-function serveStatic(req, res, urlPath) {
-  let cleanPath = decodeURIComponent(urlPath);
-  if (cleanPath === '/' || cleanPath === '') cleanPath = '/index.html';
-
-  if (
-    BLOCKED_FILES.has(cleanPath) ||
-    BLOCKED_PREFIXES.some((prefix) => cleanPath === prefix || cleanPath.startsWith(`${prefix}/`))
-  ) {
-    res.writeHead(403);
-    res.end('Forbidden');
-    return;
-  }
-
-  const rel = cleanPath.replace(/^\/+/, '');
-  const fullPath = path.resolve(ROOT, rel);
-  if (!fullPath.startsWith(ROOT + path.sep) && fullPath !== ROOT) {
-    res.writeHead(403);
-    res.end('Forbidden');
-    return;
-  }
-
-  if (!fs.existsSync(fullPath) || fs.statSync(fullPath).isDirectory()) {
-    res.writeHead(404);
-    res.end('Not found');
-    return;
-  }
-
-  const stat = fs.statSync(fullPath);
-  const ext = path.extname(fullPath).toLowerCase();
-  const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-  const rangeHeader = req.headers.range;
-
-  if (rangeHeader && (ext === '.mp4' || ext === '.webm')) {
-    const parts = rangeHeader.replace(/bytes=/, '').split('-');
-    const start = Math.max(0, parseInt(parts[0], 10) || 0);
-    const end = parts[1] ? Math.min(stat.size - 1, parseInt(parts[1], 10)) : stat.size - 1;
-    if (start >= stat.size || start > end) {
-      res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
-      res.end();
-      return;
-    }
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${stat.size}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': end - start + 1,
-      'Content-Type': contentType,
-    });
-    fs.createReadStream(fullPath, { start, end }).pipe(res);
-    return;
-  }
-
-  res.writeHead(200, {
-    'Content-Type': contentType,
-    'Content-Length': stat.size,
-    'Accept-Ranges': 'bytes',
-    'Cache-Control': 'no-cache',
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Referrer-Policy', 'same-origin');
+      const url = new URL(req.url, 'http://localhost');
+      const acceptGzip = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+      if (url.pathname === '/api/health') return json(res, 200, { ok: true, game: 'last-frontier', protocol: 2, transports: ['websocket', 'http'], rooms: rooms.size, players: sessions.size });
+      if (url.pathname === '/api/transport') {
+        if (req.method !== 'POST') return json(res, 405, { error: 'Используйте POST' });
+        const body = await readBody(req);
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'Некорректный запрос' });
+        let peer;
+        const token = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '')?.[1];
+        const s = token ? sessions.get(token) : null;
+        const connectionId = typeof body.connection === 'string' ? body.connection.slice(0, 80) : '';
+        if (['create', 'join'].includes(body.type)) {
+          peer = httpPeer(connectionId); peer.compact = body.compact === true;
+          processMessage(peer, body);
+        } else {
+          if (!s || !rooms.has(s.room)) return json(res, 410, { messages: [{ type: 'expired', message: 'Комната закрыта или время переподключения истекло' }] });
+          if (body.type === 'resume') {
+            peer = httpPeer(connectionId); peer.compact = body.compact === true;
+            bind(peer, s, rooms.get(s.room), true);
+          } else {
+            peer = s.ws;
+            if (!peer) { peer = httpPeer(connectionId); bind(peer, s, rooms.get(s.room), true); }
+            if (peer.transport !== 'http' || connectionId && peer.connectionId && connectionId !== peer.connectionId) return json(res, 409, { messages: [{ type: 'expired', message: 'Сессия открыта в другом подключении' }] });
+          }
+          peer.lastSeen = Date.now();
+          const messages = Array.isArray(body.messages) ? body.messages.slice(0, 16) : body.type && body.type !== 'resume' ? [body] : [];
+          for (const message of messages) processMessage(peer, message);
+        }
+        const active = peer.session;
+        const room = active && rooms.get(active.room);
+        return json(res, 200, { messages: peer.messages.splice(0), ...(room ? { room: roomInfo(room), state: peer.compact ? packState(room.world.snapshot()) : room.world.snapshot() } : {}) }, acceptGzip);
+      }
+      if (url.pathname === '/api/leaderboard') return json(res, 200, { runs: scores.slice(0, 15) });
+      if (url.pathname === '/api/network') {
+        let publicUrl = process.env.PUBLIC_URL || '';
+        try {
+          const tunnel = JSON.parse(fs.readFileSync(path.join(ROOT, 'data/public-url.json'), 'utf8'));
+          if (Number.isInteger(tunnel.pid) && tunnel.pid > 0) { process.kill(tunnel.pid, 0); publicUrl ||= tunnel.url; }
+        } catch { /* No live tunnel. */ }
+        const port = server.address()?.port;
+        const addresses = Object.values(os.networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => `http://${i.address}:${port}/`);
+        return json(res, 200, { addresses, publicUrl });
+      }
+      if (!['GET', 'HEAD'].includes(req.method)) return json(res, 405, { error: 'Метод не поддерживается' });
+      const clean = decodeURIComponent(url.pathname);
+      if (!['/', '/index.html', '/styles.css', '/favicon.svg', '/src/main.js', '/src/bundle.classic.js'].includes(clean) && !/^\/src\/(game|ui)\/[a-zA-Z0-9_-]+\.js$/.test(clean)) return json(res, 404, { error: 'Файл не найден' });
+      const full = path.join(ROOT, clean === '/' ? 'index.html' : clean);
+      const stat = await fs.promises.stat(full);
+      let cached = staticCache.get(full);
+      if (!cached || cached.mtime !== stat.mtimeMs || cached.size !== stat.size) {
+        const data = await fs.promises.readFile(full);
+        cached = { mtime: stat.mtimeMs, size: stat.size, data, gzip: data.length > 512 ? gzipSync(data, { level: 6 }) : null, etag: `"${stat.size}-${Math.floor(stat.mtimeMs)}"` };
+        staticCache.set(full, cached);
+      }
+      const headers = { 'Content-Type': MIME[path.extname(full)] || 'application/octet-stream', 'Cache-Control': 'no-cache', 'Vary': 'Accept-Encoding', 'ETag': cached.etag };
+      if (req.headers['if-none-match'] === cached.etag) { res.writeHead(304, headers); return res.end(); }
+      const data = acceptGzip && cached.gzip ? cached.gzip : cached.data;
+      if (data === cached.gzip) headers['Content-Encoding'] = 'gzip';
+      headers['Content-Length'] = data.length;
+      res.writeHead(200, headers); res.end(req.method === 'HEAD' ? undefined : data);
+    } catch (err) { if (!res.headersSent) json(res, err.code === 'ENOENT' ? 404 : 400, { error: 'Не удалось открыть ресурс' }); else res.end(); }
   });
-  fs.createReadStream(fullPath).pipe(res);
-}
 
-const server = http.createServer(async (req, res) => {
-  try {
-    const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-
-    if (req.method === 'OPTIONS' && urlObj.pathname.startsWith('/api/')) {
-      setCorsHeaders(res);
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    if (urlObj.pathname.startsWith('/api/')) {
-      await handleApi(req, res, urlObj);
-      return;
-    }
-
-    serveStatic(req, res, urlObj.pathname);
-  } catch (err) {
-    console.error('[server error]', err);
-    if (!res.headersSent) {
-      sendJson(res, 500, { ok: false, error: err.message || 'Internal Server Error' });
-    }
-  }
-});
-
-async function start() {
-  try {
-    await ensureSchema();
-    console.log(`[DB] PostgreSQL connected (${poolConfig.database || 'DATABASE_URL'})`);
-  } catch (err) {
-    console.error('[DB WARNING] PostgreSQL init failed:', err.message);
-  }
-
-  server.listen(PORT, HOST, () => {
-    console.log(`[SERVER] Call of Duty: Zombies 2D running at http://localhost:${PORT}/`);
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 4096,
+    perMessageDeflate: { threshold: 1024, clientNoContextTakeover: true, serverNoContextTakeover: true, concurrencyLimit: 4, zlibDeflateOptions: { level: 3, memLevel: 5 } } });
+  server.on('upgrade', (req, socket, head) => {
+    if (new URL(req.url, 'http://localhost').pathname !== '/ws' || wss.clients.size >= 300) { socket.destroy(); return; }
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   });
+
+  function roomInfo(room) {
+    return { code: room.code, owner: room.owner, mapId: room.world.mapId, runMode: room.world.director.mode, phase: room.world.status,
+      players: [...room.slots.values()].map(s => { const p = room.world.players.get(s.id); return { id: s.id, name: p.name, hero: p.hero, connected: !!s.ws, ready: s.ready }; }) };
+  }
+  function broadcast(room, data) {
+    let plain, compact, packed;
+    for (const s of room.slots.values()) {
+      if (!s.ws) continue;
+      if (data.type !== 'state') { send(s.ws, data); continue; }
+      if (s.ws.transport === 'http') continue;
+      // Serialize once per room and wire format, regardless of player count.
+      if (s.ws.compact) { packed ||= { ...data, state: packState(data.state) }; compact ||= JSON.stringify(packed); send(s.ws, packed, compact); }
+      else { plain ||= JSON.stringify(data); send(s.ws, data, plain); }
+    }
+  }
+  function announce(room) { broadcast(room, { type: 'room', room: roomInfo(room) }); }
+  function removeSession(s) {
+    const room = rooms.get(s.room);
+    if (s.ws) s.ws.session = null;
+    sessions.delete(s.token);
+    if (s.requestId) attempts.delete(s.requestId);
+    if (!room) return;
+    room.slots.delete(s.id); room.world.players.delete(s.id);
+    if (room.owner === s.id) room.owner = [...room.slots.values()].find(item => item.ws)?.id || room.slots.keys().next().value;
+    if (!room.slots.size) rooms.delete(room.code); else announce(room);
+  }
+  function resetWorld(room) {
+    const world = new World(room.world.mapId, Date.now(), room.world.director.mode);
+    for (const s of room.slots.values()) { const old = room.world.players.get(s.id); const p = world.addPlayer(s.id, old.name, old.hero); p.connected = !!s.ws; s.ready = s.id === room.owner; }
+    room.world = world; room.saved = false;
+  }
+  function disconnected(peer) {
+    const s = peer.session;
+    if (!s || s.ws !== peer) return;
+    s.ws = null; s.disconnectedAt = Date.now(); peer.session = null;
+    const room = rooms.get(s.room);
+    if (!room) return;
+    const p = room.world.players.get(s.id);
+    p.connected = false; p.input = { x: 0, y: 0 };
+    if (room.owner === s.id) room.owner = [...room.slots.values()].find(item => item.ws)?.id || s.id;
+    announce(room);
+  }
+  function httpPeer(connectionId) {
+    return { transport: 'http', connectionId, readyState: WebSocket.OPEN, messages: [], session: null, lastSeen: Date.now(), windowStart: Date.now(), count: 0,
+      send(message) { if (message.type === 'state') return; if (message.type === 'room') this.messages = this.messages.filter(m => m.type !== 'room'); this.messages.push(message); if (this.messages.length > 32) this.messages.shift(); },
+      close() { this.readyState = WebSocket.CLOSED; disconnected(this); } };
+  }
+  function bind(peer, s, room, resumed = false) {
+    if (s.ws && s.ws !== peer) { s.ws.session = null; s.ws.close(4001, 'Подключено в другой вкладке'); }
+    s.ws = peer; s.disconnectedAt = 0; s.lastInput = Date.now(); peer.session = s;
+    room.world.players.get(s.id).connected = true;
+    send(peer, { type: 'welcome', id: s.id, token: s.token, resumed, room: roomInfo(room), state: peer.compact ? packState(room.world.snapshot()) : room.world.snapshot() });
+    announce(room);
+  }
+  function processMessage(peer, m) {
+    const now = Date.now();
+    if (now - peer.windowStart > 1000) { peer.windowStart = now; peer.count = 0; }
+    if (++peer.count > 100) { peer.close(1008, 'Слишком много запросов'); return; }
+    const fail = message => send(peer, { type: 'error', message });
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return fail('Некорректное сообщение');
+    if (m.type === 'ping') { send(peer, { type: 'pong', at: m.at }); return; }
+    if (['create', 'join', 'resume'].includes(m.type)) {
+      peer.compact = m.compact === true;
+      if (peer.session) return fail('Сначала выйдите из текущей комнаты');
+      // A retry after a lost handshake must not create a duplicate player.
+      const requestId = typeof m.requestId === 'string' && /^[a-zA-Z0-9_-]{16,100}$/.test(m.requestId) ? m.requestId : '';
+      const previous = requestId && sessions.get(attempts.get(requestId));
+      if (previous && rooms.has(previous.room)) { bind(peer, previous, rooms.get(previous.room), true); return; }
+      if (m.type === 'resume') {
+        const s = sessions.get(String(m.token));
+        if (!s || !rooms.has(s.room)) { send(peer, { type: 'expired', message: 'Комната закрыта или время переподключения истекло' }); return; }
+        bind(peer, s, rooms.get(s.room), true); return;
+      }
+      let room;
+      if (m.type === 'create') {
+        if (rooms.size >= maxRooms) return fail('Сервер заполнен. Попробуйте позже');
+        const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        let code;
+        do { code = [...crypto.randomBytes(6)].map(n => alphabet[n % alphabet.length]).join(''); } while (rooms.has(code));
+        room = { code, owner: '', slots: new Map(), world: new World(MAPS[m.mapId] ? m.mapId : 'outpost', Date.now(), m.runMode), saved: false, createdAt: now };
+        rooms.set(code, room);
+      } else {
+        room = rooms.get(String(m.code || '').toUpperCase().trim());
+        if (!room) return fail('Комната не найдена. Проверьте код и адрес сервера');
+        if (room.world.status !== 'lobby') return fail('Забег уже начался. Дождитесь нового забега');
+        if (room.slots.size >= MAX_PLAYERS) return fail('В комнате уже десять игроков');
+      }
+      const s = { id: crypto.randomUUID(), token: crypto.randomBytes(32).toString('hex'), room: room.code, ws: null, ready: !room.owner, lastInput: now, requestId, commands: new Set() };
+      room.owner ||= s.id;
+      room.slots.set(s.id, s); sessions.set(s.token, s);
+      if (requestId) attempts.set(requestId, s.token);
+      room.world.addPlayer(s.id, validName(m.name), HEROES[m.hero] ? m.hero : 'ranger');
+      bind(peer, s, room); return;
+    }
+    const s = peer.session;
+    if (!s) return fail('Сначала создайте комнату или войдите по коду');
+    const room = rooms.get(s.room);
+    if (!room) return;
+    if (typeof m.commandId === 'string') {
+      if (s.commands.has(m.commandId)) { send(peer, { type: 'ack', commandId: m.commandId }); return; }
+      s.commands.add(m.commandId);
+      if (s.commands.size > 128) s.commands.delete(s.commands.values().next().value);
+      send(peer, { type: 'ack', commandId: m.commandId });
+    }
+    if (m.type === 'input') { room.world.setInput(s.id, m); s.lastInput = now; }
+    if (m.type === 'interact') room.world.interact(s.id);
+    if (m.type === 'ping-mark') { const p = room.world.players.get(s.id); if (p && !p.dead && room.world.time >= (s.nextMark || 0)) { room.world.effect('ping', p.x, p.y, 85, p.color, { ttl: 4 }); s.nextMark = room.world.time + 2; } }
+    if (m.type === 'upgrade' && typeof m.option === 'string') room.world.choose(s.id, m.option);
+    if (m.type === 'ready' && room.world.status === 'lobby') { s.ready = !!m.ready; announce(room); }
+    if (m.type === 'start') {
+      if (s.id !== room.owner) return fail('Забег запускает командир комнаты');
+      if (room.world.status !== 'lobby') return;
+      if ([...room.slots.values()].some(p => !p.ws || (!p.ready && p.id !== room.owner))) return fail('Дождитесь готовности всех игроков');
+      room.world.start(); announce(room);
+    }
+    if (m.type === 'restart') {
+      if (s.id !== room.owner) return fail('Новый забег запускает командир');
+      if (!['gameover', 'victory'].includes(room.world.status)) return fail('Текущий забег ещё идёт');
+      resetWorld(room); announce(room); broadcast(room, { type: 'state', state: room.world.snapshot(), room: roomInfo(room) });
+    }
+    if (m.type === 'leave') { removeSession(s); send(peer, { type: 'left' }); }
+  }
+  wss.on('connection', ws => {
+    ws.transport = 'websocket'; ws.alive = true; ws.windowStart = Date.now(); ws.count = 0; ws.controlQueue = [];
+    ws.on('error', () => {});
+    ws.on('pong', () => { ws.alive = true; });
+    ws.on('message', buffer => { try { processMessage(ws, JSON.parse(buffer.toString())); } catch { send(ws, { type: 'error', message: 'Некорректное сообщение' }); } });
+    ws.on('close', () => disconnected(ws));
+  });
+  const timer = setInterval(() => {
+    const now = Date.now();
+    for (const s of sessions.values()) {
+      if (s.ws?.transport === 'http' && now - s.ws.lastSeen > 10000) s.ws.close();
+      if (!s.ws && now - s.disconnectedAt > reconnectMs) { removeSession(s); continue; }
+      if (now - s.lastInput > (s.ws?.transport === 'http' ? 1500 : 400)) rooms.get(s.room)?.world.setInput(s.id, { x: 0, y: 0 });
+      if (s.ws) flush(s.ws);
+    }
+    tickCount++;
+    for (const room of rooms.values()) {
+      room.world.tick(1 / 30);
+      if (['gameover', 'victory'].includes(room.world.status)) record(room);
+      // Waiting rooms need one small reconciliation per second, not 15 worlds/s.
+      const cadence = room.world.status === 'playing' ? 2 : 30;
+      if (tickCount % cadence === 0 && [...room.slots.values()].some(s => s.ws?.transport === 'websocket')) broadcast(room, { type: 'state', state: room.world.snapshot(), room: roomInfo(room) });
+      if (now - room.createdAt > 2 * 60 * 60 * 1000) {
+        for (const s of [...room.slots.values()]) { send(s.ws, { type: 'expired', message: 'Время комнаты истекло' }); const peer = s.ws; removeSession(s); peer?.close(); }
+      }
+    }
+  }, 1000 / 30);
+  const heartbeat = setInterval(() => {
+    for (const ws of wss.clients) { if (!ws.alive) { ws.terminate(); continue; } ws.alive = false; ws.ping(); }
+  }, 10000);
+  async function close() {
+    clearInterval(timer); clearInterval(heartbeat);
+    for (const ws of wss.clients) ws.terminate();
+    wss.close();
+    await new Promise(resolve => server.close(resolve));
+    await persist; await pool?.end();
+  }
+  return { server, rooms, sessions, close };
 }
 
-start();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const app = createGameServer();
+  const port = Number(process.env.PORT || 3000);
+  app.server.listen(port, process.env.HOST || '0.0.0.0', () => console.log(`\nПОСЛЕДНИЙ РУБЕЖ · http://localhost:${app.server.address().port}/\nОнлайн: комнаты до 10 игроков. Интернет без VPS: npm run share\n`));
+  app.server.on('error', err => { console.error('[server]', err.message); process.exit(1); });
+  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => { await app.close(); process.exit(0); });
+}
